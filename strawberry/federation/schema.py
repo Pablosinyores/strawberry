@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from strawberry.extensions import SchemaExtension
     from strawberry.federation.schema_directives import ComposeDirective
     from strawberry.schema.config import StrawberryConfig
+    from strawberry.schema.exception_handlers import ExceptionHandler
     from strawberry.schema_directive import StrawberrySchemaDirective
     from strawberry.types.enum import StrawberryEnumDefinition
 
@@ -61,6 +62,7 @@ class Schema(BaseSchema):
         scalar_overrides: dict[object, Union[type, "ScalarWrapper", "ScalarDefinition"]]
         | None = None,
         schema_directives: Iterable[object] = (),
+        exception_handlers: Iterable["ExceptionHandler"] = (),
         federation_version: Literal[
             "2.0",
             "2.1",
@@ -110,6 +112,7 @@ class Schema(BaseSchema):
             config=config,
             scalar_overrides=federation_scalar_overrides,
             schema_directives=schema_directives,
+            exception_handlers=exception_handlers,
         )
 
         self.schema_directives = list(schema_directives)

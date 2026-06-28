@@ -160,10 +160,11 @@ Here's an example of RELEASE.md:
 release type: patch
 social_messages:
   x: >-
-    {project_name} {version} fixes schema printing for nullable input defaults.
+    {project_name} {version} is out! This release fixes schema printing for
+    nullable input defaults. 🍓
   linkedin: >-
-    {project_name} {version} fixes schema printing for nullable input defaults
-    so generated SDL now keeps explicit null values.
+    {project_name} {version} is out. This release fixes schema printing for
+    nullable input defaults, so generated SDL now keeps explicit null values.
 ---
 
 This release fixes schema printing for nullable input defaults.
@@ -178,5 +179,6 @@ doubt feel free to ask.
 
 Release notes should start with `This release adds ...` or
 `This release fixes ...` and should explain the user-visible behavior first.
-Include social messages for X and LinkedIn so the release announcement reads
-well on each platform.
+Include social messages for X and LinkedIn. They should read like natural
+release announcements, start with `{project_name} {version} is out`, and explain
+what changed and who benefits.

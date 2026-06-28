@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import sys
 import typing
 from functools import partial, reduce
@@ -50,6 +51,8 @@ from strawberry.exceptions import (
 )
 from strawberry.extensions.field_extension import build_field_extension_resolvers
 from strawberry.relay.types import GlobalID
+from strawberry.schema.exception_handlers import should_handle_exception
+from strawberry.schema.type_comparison import is_same_type_definition
 from strawberry.schema.types.scalar import (
     DEFAULT_SCALAR_REGISTRY,
     _make_scalar_type,
@@ -79,7 +82,7 @@ from . import compat
 from .types.concrete_type import ConcreteType
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping
+    from collections.abc import Awaitable, Callable, Iterable, Mapping
 
     from graphql import (
         GraphQLInputType,
@@ -90,11 +93,15 @@ if TYPE_CHECKING:
 
     from strawberry.directive import StrawberryDirective
     from strawberry.schema.config import StrawberryConfig
+    from strawberry.schema.exception_handlers import ExceptionHandler
     from strawberry.schema_directive import StrawberrySchemaDirective
     from strawberry.types.enum import EnumValue
     from strawberry.types.field import StrawberryField
     from strawberry.types.info import Info
     from strawberry.types.scalar import ScalarDefinition
+
+
+UNHANDLED = object()
 
 
 FieldType = TypeVar(
@@ -228,20 +235,7 @@ def get_arguments(
     config: StrawberryConfig,
     scalar_registry: Mapping[object, ScalarWrapper | ScalarDefinition],
 ) -> tuple[list[Any], dict[str, Any]]:
-    # TODO: An extension might have changed the resolver arguments,
-    # but we need them here since we are calling it.
-    # This is a bit of a hack, but it's the easiest way to get the arguments
-    # This happens in mutation.InputMutationExtension
-    field_arguments = field.arguments[:]
-    if field.base_resolver:
-        existing = {arg.python_name for arg in field_arguments}
-        field_arguments.extend(
-            [
-                arg
-                for arg in field.base_resolver.arguments
-                if arg.python_name not in existing
-            ]
-        )
+    field_arguments = _get_field_arguments(field)
 
     kwargs = convert_arguments(
         kwargs,
@@ -274,6 +268,47 @@ def get_arguments(
     return args, kwargs
 
 
+def _get_field_arguments(field: StrawberryField) -> list[StrawberryArgument]:
+    # TODO: An extension might have changed the resolver arguments,
+    # but we need them here since we are calling it.
+    # This is a bit of a hack, but it's the easiest way to get the arguments.
+    # This happens in mutation.InputMutationExtension.
+    field_arguments = field.arguments[:]
+
+    if field.base_resolver:
+        existing = {arg.python_name for arg in field_arguments}
+        field_arguments.extend(
+            [
+                arg
+                for arg in field.base_resolver.arguments
+                if arg.python_name not in existing
+            ]
+        )
+
+    return field_arguments
+
+
+def _get_raw_arguments(
+    *,
+    field: StrawberryField,
+    kwargs: dict[str, Any],
+    config: StrawberryConfig,
+) -> dict[str, Any]:
+    field_arguments = _get_field_arguments(field)
+
+    raw_kwargs: dict[str, Any] = {}
+
+    for argument in field_arguments:
+        assert argument.python_name
+
+        name = config.name_converter.from_argument(argument)
+
+        if name in kwargs:
+            raw_kwargs[argument.python_name] = kwargs[name]
+
+    return raw_kwargs
+
+
 class GraphQLCoreConverter:
     # TODO: Make abstract
 
@@ -286,11 +321,13 @@ class GraphQLCoreConverter:
         scalar_overrides: Mapping[object, ScalarWrapper | ScalarDefinition],
         scalar_map: Mapping[object, ScalarDefinition],
         get_fields: Callable[[StrawberryObjectDefinition], list[StrawberryField]],
+        exception_handlers: Iterable[ExceptionHandler] = (),
     ) -> None:
         self.type_map: dict[str, ConcreteType] = {}
         self.config = config
         self.scalar_registry = self._get_scalar_registry(scalar_overrides, scalar_map)
         self.get_fields = get_fields
+        self.exception_handlers = tuple(exception_handlers)
 
     def _get_scalar_registry(
         self,
@@ -754,6 +791,15 @@ class GraphQLCoreConverter:
                 _source, info=info, args=field_args, kwargs=field_kwargs
             )
 
+        def _can_handle_exception(exc: Exception) -> bool:
+            if field.is_subscription:
+                return False
+
+            return any(
+                should_handle_exception(handler, exc, field)
+                for handler in self.exception_handlers
+            )
+
         def wrap_field_extensions() -> Callable[..., Any]:
             """Wrap the provided field resolver with the middleware."""
             for extension in field.extensions:
@@ -768,17 +814,31 @@ class GraphQLCoreConverter:
             ) -> Any:
                 # parse field arguments into Strawberry input types and convert
                 # field names to Python equivalents
-                field_args, field_kwargs = get_arguments(
-                    field=field,
-                    source=_source,
-                    info=info,
-                    kwargs=kwargs,
-                    config=self.config,
-                    scalar_registry=self.scalar_registry,
-                )
+                conversion_exception: Exception | None = None
+
+                try:
+                    field_args, field_kwargs = get_arguments(
+                        field=field,
+                        source=_source,
+                        info=info,
+                        kwargs=kwargs,
+                        config=self.config,
+                        scalar_registry=self.scalar_registry,
+                    )
+                except Exception as exc:
+                    if not _can_handle_exception(exc):
+                        raise
+
+                    conversion_exception = exc
+                    field_args = []
+                    field_kwargs = _get_raw_arguments(
+                        field=field,
+                        kwargs=kwargs,
+                        config=self.config,
+                    )
 
                 resolver_requested_info = False
-                if "info" in field_kwargs:
+                if conversion_exception is None and "info" in field_kwargs:
                     resolver_requested_info = True
                     # remove info from field_kwargs because we're passing it
                     # explicitly to the extensions
@@ -788,14 +848,47 @@ class GraphQLCoreConverter:
                 # separate arguments so we have to wrap the function so that we
                 # can pass them in
                 def wrapped_get_result(_source: Any, info: Info, **kwargs: Any) -> Any:
-                    # if the resolver function requested the info object info
+                    # Exception handling happens here, at the innermost point of
+                    # the field-extension chain, so only exceptions from argument
+                    # conversion or the resolver itself can be converted into
+                    # union results. Errors raised by the field extensions
+                    # wrapping this function stay errors.
+                    async def await_result(result: Any) -> Any:
+                        try:
+                            return await result
+                        except Exception as exc:
+                            handled = _handle_exception(exc, info)
+                            if handled is not UNHANDLED:
+                                return await await_maybe(handled)
+                            raise
+
+                    # argument conversion already failed, so the resolver is
+                    # never called: convert the stored exception or re-raise it.
+                    if conversion_exception is not None:
+                        handled = _handle_exception(conversion_exception, info)
+                        if handled is not UNHANDLED:
+                            return handled
+                        raise conversion_exception
+
+                    # if the resolver function requested the info object
                     # then put it back in the kwargs dictionary
                     if resolver_requested_info:
                         kwargs["info"] = info
 
-                    return _get_result(
-                        _source, info, field_args=field_args, field_kwargs=kwargs
-                    )
+                    try:
+                        result = _get_result(
+                            _source, info, field_args=field_args, field_kwargs=kwargs
+                        )
+                    except Exception as exc:
+                        handled = _handle_exception(exc, info)
+                        if handled is not UNHANDLED:
+                            return handled
+                        raise
+
+                    if inspect.isawaitable(result):
+                        return await_result(result)
+
+                    return result
 
                 # combine all the extension resolvers
                 return reduce(
@@ -807,6 +900,16 @@ class GraphQLCoreConverter:
             return extension_resolver
 
         _get_result_with_extensions = wrap_field_extensions()
+
+        def _handle_exception(exc: Exception, info: Info) -> Any:
+            if field.is_subscription:
+                return UNHANDLED
+
+            for handler in self.exception_handlers:
+                if should_handle_exception(handler, exc, field):
+                    return handler.handle(exc, field=field, info=info)
+
+            return UNHANDLED
 
         def _resolver(_source: Any, info: GraphQLResolveInfo, **kwargs: Any) -> Any:
             strawberry_info = _strawberry_info_from_graphql(info)
@@ -1085,76 +1188,7 @@ class GraphQLCoreConverter:
         first_type_definition: StrawberryObjectDefinition | StrawberryType,
         second_type_definition: StrawberryObjectDefinition | StrawberryType,
     ) -> bool:
-        # TODO: maybe move this on the StrawberryType class
-        if not isinstance(
-            first_type_definition, StrawberryObjectDefinition
-        ) or not isinstance(second_type_definition, StrawberryObjectDefinition):
-            return False
-
-        if first_type_definition.origin is second_type_definition.origin:
-            return True
-
-        # When sys.modules is cleared (e.g. by test runners or Django reloaders)
-        # and a module is reimported, Python creates brand-new class objects.
-        # The identity check above fails, so fall back to comparing the
-        # fully-qualified class name which survives reimports.
-        first_origin = first_type_definition.origin
-        second_origin = second_type_definition.origin
-        if (
-            first_origin.__qualname__ == second_origin.__qualname__
-            and first_origin.__module__ == second_origin.__module__
-        ):
-            return True
-
-        if (
-            first_type_definition.concrete_of is None
-            or first_type_definition.concrete_of != second_type_definition.concrete_of
-            or (
-                first_type_definition.type_var_map.keys()
-                != second_type_definition.type_var_map.keys()
-            )
-        ):
-            return False
-
-        # manually compare type_var_maps while resolving any lazy types
-        # so that they're considered equal to the actual types they're referencing
-        for type_var, type1 in first_type_definition.type_var_map.items():
-            type2 = second_type_definition.type_var_map[type_var]
-
-            # both lazy types are always resolved because two different lazy types
-            # may be referencing the same actual type
-            if isinstance(type1, LazyType):
-                type1 = type1.resolve_type()  # noqa: PLW2901
-            elif isinstance(type1, StrawberryOptional) and isinstance(
-                type1.of_type, LazyType
-            ):
-                type1.of_type = type1.of_type.resolve_type()
-
-            if isinstance(type2, LazyType):
-                type2 = type2.resolve_type()
-            elif isinstance(type2, StrawberryOptional) and isinstance(
-                type2.of_type, LazyType
-            ):
-                type2.of_type = type2.of_type.resolve_type()
-
-            same_type = type1 == type2
-            # If both types have object definitions, we are handling a nested generic
-            # type like `Foo[Foo[int]]`, meaning we need to compare their type definitions
-            # as they will actually be different instances of the type
-            if (
-                not same_type
-                and has_object_definition(type1)
-                and has_object_definition(type2)
-            ):
-                same_type = self.is_same_type_definition(
-                    type1.__strawberry_definition__,
-                    type2.__strawberry_definition__,
-                )
-
-            if not same_type:
-                return False
-
-        return True
+        return is_same_type_definition(first_type_definition, second_type_definition)
 
 
 __all__ = ["GraphQLCoreConverter"]
