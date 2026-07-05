@@ -62,7 +62,6 @@ class Schema(BaseSchema):
         scalar_overrides: dict[object, Union[type, "ScalarWrapper", "ScalarDefinition"]]
         | None = None,
         schema_directives: Iterable[object] = (),
-        exception_handlers: Iterable["ExceptionHandler"] = (),
         federation_version: Literal[
             "2.0",
             "2.1",
@@ -77,6 +76,7 @@ class Schema(BaseSchema):
             "2.10",
             "2.11",
         ] = "2.11",
+        exception_handlers: Iterable["ExceptionHandler"] = (),
     ) -> None:
         # Convert version string (e.g., "2.5") to version tuple (e.g., (2, 5))
         self.federation_version = parse_version(federation_version)

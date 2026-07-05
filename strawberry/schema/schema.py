@@ -48,6 +48,7 @@ from strawberry.extensions.directives import (
 )
 from strawberry.extensions.runner import SchemaExtensionsRunner
 from strawberry.printer import print_schema
+from strawberry.schema.exception_handlers import validate_exception_handlers
 from strawberry.schema.schema_converter import GraphQLCoreConverter
 from strawberry.schema.validation_rules.maybe_null import MaybeNullValidationRule
 from strawberry.schema.validation_rules.one_of import OneOfInputValidationRule
@@ -337,6 +338,7 @@ class Schema(BaseSchema):
         )
         self.config = config or StrawberryConfig()
         self.exception_handlers = tuple(exception_handlers)
+        validate_exception_handlers(self.exception_handlers)
 
         self.schema_converter = GraphQLCoreConverter(
             self.config,

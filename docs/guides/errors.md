@@ -384,6 +384,11 @@ If multiple handlers match, Strawberry uses the first matching handler from the
 `exception_handlers` list. Handlers do not apply to subscription fields or to
 list fields such as `list[Success | UsernameAlreadyExistsError]`.
 
+When the error type is generic, set `error_type` to the concrete instantiation
+that appears in the union (for example `error_type = ValidationError[int]`),
+rather than the bare generic (`ValidationError`), so it matches the correct
+member of the union.
+
 Converted exceptions are treated as expected GraphQL results. They are not added
 to the response's top-level `errors` list and are not passed to
 `Schema.process_errors`, so avoid using broad exception types such as

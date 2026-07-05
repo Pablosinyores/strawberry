@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated, Any, Protocol, get_origin
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Protocol,
+    get_origin,
+    runtime_checkable,
+)
 
 from strawberry.annotation import StrawberryAnnotation
 from strawberry.schema.type_comparison import is_same_type, resolve_lazy_type
@@ -14,6 +21,7 @@ if TYPE_CHECKING:
     from strawberry.types.info import Info
 
 
+@runtime_checkable
 class ExceptionHandler(Protocol):
     exception_type: type[Exception] | Collection[type[Exception]]
     error_type: type
@@ -41,7 +49,15 @@ def field_contains_type(field: StrawberryField, type_: type) -> bool:
     if not isinstance(field_type, StrawberryUnion):
         return False
 
-    return any(is_same_type(union_type, type_) for union_type in field_type.types)
+    # Resolve the target the same way the union members were resolved at schema
+    # build time. A concrete generic error type (e.g. ``Error[int]``) otherwise
+    # collapses to the bare generic definition and silently never matches the
+    # ``Error[int]`` member of the union.
+    target_type = resolve_lazy_type(type_)
+    if get_origin(target_type) is not None:
+        target_type = StrawberryAnnotation(target_type).resolve()
+
+    return any(is_same_type(union_type, target_type) for union_type in field_type.types)
 
 
 def get_exception_types(
@@ -55,20 +71,64 @@ def get_exception_types(
     return tuple(exception_type)
 
 
-def should_handle_exception(
-    handler: ExceptionHandler,
-    exception: Exception,
-    field: StrawberryField,
-) -> bool:
-    if not isinstance(exception, get_exception_types(handler)):
-        return False
+def validate_exception_handlers(handlers: tuple[ExceptionHandler, ...]) -> None:
+    """Validate exception handlers eagerly, at schema-construction time.
 
-    return field_contains_type(field, handler.error_type)
+    A misconfigured handler otherwise only fails when a matching exception is
+    raised at request time, where it typically masks the original error (a bad
+    ``exception_type`` raises ``TypeError`` inside ``isinstance``; a class passed
+    instead of an instance, or a mistyped ``handle`` method, surfaces as an
+    unrelated error). Failing here keeps the real cause visible.
+    """
+    from collections.abc import Collection
+
+    for handler in handlers:
+        name = handler.__name__ if isinstance(handler, type) else type(handler).__name__
+
+        if isinstance(handler, type):
+            raise TypeError(
+                f"Exception handler '{name}' must be passed as an instance, not a "
+                f"class (did you mean '{name}()'?)."
+            )
+
+        exception_type = getattr(handler, "exception_type", None)
+
+        if isinstance(exception_type, type):
+            exception_types: tuple[object, ...] = (exception_type,)
+        elif isinstance(exception_type, Collection) and not isinstance(
+            exception_type, (str, bytes)
+        ):
+            exception_types = tuple(exception_type)
+        else:
+            exception_types = ()
+
+        if not exception_types or not all(
+            isinstance(candidate, type) and issubclass(candidate, BaseException)
+            for candidate in exception_types
+        ):
+            raise TypeError(
+                f"Exception handler '{name}' must define 'exception_type' as an "
+                f"exception class or a collection of exception classes, got "
+                f"{exception_type!r}."
+            )
+
+        if getattr(handler, "error_type", None) is None:
+            raise TypeError(
+                f"Exception handler '{name}' must define 'error_type' as the "
+                f"GraphQL type it returns."
+            )
+
+        handle = getattr(type(handler), "handle", None)
+
+        if handle is None or handle is ExceptionHandler.handle:
+            raise TypeError(
+                f"Exception handler '{name}' must implement a 'handle' method."
+            )
 
 
 __all__ = [
     "ExceptionHandler",
     "field_contains_type",
     "get_exception_types",
-    "should_handle_exception",
+    "validate_exception_handlers",
 ]

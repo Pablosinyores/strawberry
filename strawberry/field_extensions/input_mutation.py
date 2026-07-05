@@ -67,7 +67,7 @@ class InputMutationExtension(FieldExtension):
             source,
             info,
             **kwargs,
-            **vars(input_args),
+            **_unpack_input(input_args),
         )
 
     async def resolve_async(
@@ -82,8 +82,18 @@ class InputMutationExtension(FieldExtension):
             source,
             info,
             **kwargs,
-            **vars(input_args),
+            **_unpack_input(input_args),
         )
+
+
+def _unpack_input(input_args: Any) -> dict[str, Any]:
+    # `input_args` is normally the converted input instance. When argument
+    # conversion has failed (e.g. an exception handler is about to convert the
+    # error) it is instead the raw mapping of arguments, so accept both.
+    if isinstance(input_args, dict):
+        return input_args
+
+    return vars(input_args)
 
 
 __all__ = ["InputMutationExtension"]

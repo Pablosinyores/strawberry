@@ -51,7 +51,10 @@ from strawberry.exceptions import (
 )
 from strawberry.extensions.field_extension import build_field_extension_resolvers
 from strawberry.relay.types import GlobalID
-from strawberry.schema.exception_handlers import should_handle_exception
+from strawberry.schema.exception_handlers import (
+    field_contains_type,
+    get_exception_types,
+)
 from strawberry.schema.type_comparison import is_same_type_definition
 from strawberry.schema.types.scalar import (
     DEFAULT_SCALAR_REGISTRY,
@@ -294,6 +297,11 @@ def _get_raw_arguments(
     kwargs: dict[str, Any],
     config: StrawberryConfig,
 ) -> dict[str, Any]:
+    # On the argument-conversion-error path there are no converted input objects
+    # to hand to the field-extension chain. The extensions still run (so e.g.
+    # permission checks keep gating the request) with the raw argument values,
+    # then the innermost resolver ignores these kwargs and converts the stored
+    # exception instead.
     field_arguments = _get_field_arguments(field)
 
     raw_kwargs: dict[str, Any] = {}
@@ -759,12 +767,38 @@ class GraphQLCoreConverter:
 
         return graphql_object_type
 
+    def _get_field_exception_handlers(
+        self, field: StrawberryField
+    ) -> tuple[tuple[tuple[type[Exception], ...], ExceptionHandler], ...]:
+        """Handlers that can apply to ``field``, resolved once at build time.
+
+        Each entry pairs a handler with its pre-computed exception-type tuple so
+        the request path only needs an ``isinstance`` check. Subscriptions never
+        convert exceptions into union results.
+        """
+        if not self.exception_handlers or field.is_subscription:
+            return ()
+
+        return tuple(
+            (get_exception_types(handler), handler)
+            for handler in self.exception_handlers
+            if field_contains_type(field, handler.error_type)
+        )
+
     def from_resolver(
         self, field: StrawberryField
     ) -> Callable:  # TODO: Take StrawberryResolver
         field.default_resolver = self.config.default_resolver
 
-        if field.is_basic_field:
+        # Handlers whose ``error_type`` is part of this field's return union,
+        # computed once at schema-build time. ``field_contains_type`` only
+        # depends on the field type and the handler, so the request path is left
+        # with the cheap ``isinstance`` check below. When this is empty (no
+        # handler can ever apply — including for subscriptions) the resolver
+        # takes the pre-feature fast paths, so existing schemas pay no overhead.
+        field_exception_handlers = self._get_field_exception_handlers(field)
+
+        if field.is_basic_field and not field_exception_handlers:
 
             def _get_basic_result(_source: Any, *args: str, **kwargs: Any) -> Any:
                 # Call `get_result` without an info object or any args or
@@ -791,14 +825,33 @@ class GraphQLCoreConverter:
                 _source, info=info, args=field_args, kwargs=field_kwargs
             )
 
-        def _can_handle_exception(exc: Exception) -> bool:
-            if field.is_subscription:
-                return False
+        def _find_handler(exc: Exception) -> ExceptionHandler | None:
+            for exception_types, handler in field_exception_handlers:
+                if isinstance(exc, exception_types):
+                    return handler
 
-            return any(
-                should_handle_exception(handler, exc, field)
-                for handler in self.exception_handlers
-            )
+            return None
+
+        def _handle_exception(exc: Exception, info: Info) -> Any:
+            handler = _find_handler(exc)
+            if handler is None:
+                return UNHANDLED
+
+            return handler.handle(exc, field=field, info=info)
+
+        def _deliver_handled(handled: Any) -> Any:
+            # Deliver a handler result with the same sync/async shape the
+            # resolver would have produced. On async fields the inner result is
+            # ``await``-ed by the field-extension chain, so it must be awaitable
+            # (this is also where an async ``handle`` implementation is awaited).
+            if field.is_async:
+
+                async def _resolve_handled() -> Any:
+                    return await await_maybe(handled)
+
+                return _resolve_handled()
+
+            return handled
 
         def wrap_field_extensions() -> Callable[..., Any]:
             """Wrap the provided field resolver with the middleware."""
@@ -816,7 +869,7 @@ class GraphQLCoreConverter:
                 # field names to Python equivalents
                 conversion_exception: Exception | None = None
 
-                try:
+                if not field_exception_handlers:
                     field_args, field_kwargs = get_arguments(
                         field=field,
                         source=_source,
@@ -825,17 +878,27 @@ class GraphQLCoreConverter:
                         config=self.config,
                         scalar_registry=self.scalar_registry,
                     )
-                except Exception as exc:
-                    if not _can_handle_exception(exc):
-                        raise
+                else:
+                    try:
+                        field_args, field_kwargs = get_arguments(
+                            field=field,
+                            source=_source,
+                            info=info,
+                            kwargs=kwargs,
+                            config=self.config,
+                            scalar_registry=self.scalar_registry,
+                        )
+                    except Exception as exc:
+                        if _find_handler(exc) is None:
+                            raise
 
-                    conversion_exception = exc
-                    field_args = []
-                    field_kwargs = _get_raw_arguments(
-                        field=field,
-                        kwargs=kwargs,
-                        config=self.config,
-                    )
+                        conversion_exception = exc
+                        field_args = []
+                        field_kwargs = _get_raw_arguments(
+                            field=field,
+                            kwargs=kwargs,
+                            config=self.config,
+                        )
 
                 resolver_requested_info = False
                 if conversion_exception is None and "info" in field_kwargs:
@@ -848,26 +911,12 @@ class GraphQLCoreConverter:
                 # separate arguments so we have to wrap the function so that we
                 # can pass them in
                 def wrapped_get_result(_source: Any, info: Info, **kwargs: Any) -> Any:
-                    # Exception handling happens here, at the innermost point of
-                    # the field-extension chain, so only exceptions from argument
-                    # conversion or the resolver itself can be converted into
-                    # union results. Errors raised by the field extensions
-                    # wrapping this function stay errors.
-                    async def await_result(result: Any) -> Any:
-                        try:
-                            return await result
-                        except Exception as exc:
-                            handled = _handle_exception(exc, info)
-                            if handled is not UNHANDLED:
-                                return await await_maybe(handled)
-                            raise
-
                     # argument conversion already failed, so the resolver is
                     # never called: convert the stored exception or re-raise it.
                     if conversion_exception is not None:
                         handled = _handle_exception(conversion_exception, info)
                         if handled is not UNHANDLED:
-                            return handled
+                            return _deliver_handled(handled)
                         raise conversion_exception
 
                     # if the resolver function requested the info object
@@ -875,6 +924,19 @@ class GraphQLCoreConverter:
                     if resolver_requested_info:
                         kwargs["info"] = info
 
+                    if not field_exception_handlers:
+                        # Fast path: no handler can apply to this field, so match
+                        # the pre-feature behaviour exactly — no try/except and no
+                        # awaitable wrapping, leaving the resolver's original
+                        # Task/Future visible to the field extensions.
+                        return _get_result(
+                            _source, info, field_args=field_args, field_kwargs=kwargs
+                        )
+
+                    # Exception handling happens here, at the innermost point of
+                    # the field-extension chain, so only exceptions from the
+                    # resolver itself can be converted into union results. Errors
+                    # raised by the field extensions wrapping this stay errors.
                     try:
                         result = _get_result(
                             _source, info, field_args=field_args, field_kwargs=kwargs
@@ -882,10 +944,20 @@ class GraphQLCoreConverter:
                     except Exception as exc:
                         handled = _handle_exception(exc, info)
                         if handled is not UNHANDLED:
-                            return handled
+                            return _deliver_handled(handled)
                         raise
 
                     if inspect.isawaitable(result):
+
+                        async def await_result(result: Any) -> Any:
+                            try:
+                                return await result
+                            except Exception as exc:
+                                handled = _handle_exception(exc, info)
+                                if handled is not UNHANDLED:
+                                    return await await_maybe(handled)
+                                raise
+
                         return await_result(result)
 
                     return result
@@ -900,16 +972,6 @@ class GraphQLCoreConverter:
             return extension_resolver
 
         _get_result_with_extensions = wrap_field_extensions()
-
-        def _handle_exception(exc: Exception, info: Info) -> Any:
-            if field.is_subscription:
-                return UNHANDLED
-
-            for handler in self.exception_handlers:
-                if should_handle_exception(handler, exc, field):
-                    return handler.handle(exc, field=field, info=info)
-
-            return UNHANDLED
 
         def _resolver(_source: Any, info: GraphQLResolveInfo, **kwargs: Any) -> Any:
             strawberry_info = _strawberry_info_from_graphql(info)

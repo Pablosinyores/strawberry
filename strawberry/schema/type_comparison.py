@@ -19,7 +19,10 @@ def resolve_lazy_type(type_: object) -> object:
     return type_
 
 
-def get_object_definition(type_: object) -> StrawberryObjectDefinition | None:
+# NOTE: named ``_resolve_object_definition`` (not ``get_object_definition``) to
+# avoid colliding with the public ``strawberry.types.base.get_object_definition``,
+# which has a different signature/semantics and does not resolve lazy types.
+def _resolve_object_definition(type_: object) -> StrawberryObjectDefinition | None:
     type_ = resolve_lazy_type(type_)
 
     if isinstance(type_, StrawberryObjectDefinition):
@@ -38,8 +41,8 @@ def is_same_type(left: object, right: object) -> bool:
     if left is right:
         return True
 
-    left_definition = get_object_definition(left)
-    right_definition = get_object_definition(right)
+    left_definition = _resolve_object_definition(left)
+    right_definition = _resolve_object_definition(right)
 
     if left_definition is None or right_definition is None:
         return False
@@ -109,7 +112,6 @@ def is_same_type_definition(
 
 
 __all__ = [
-    "get_object_definition",
     "is_same_type",
     "is_same_type_definition",
     "resolve_lazy_type",

@@ -1,16 +1,20 @@
 import dataclasses
+import inspect
 from collections.abc import AsyncGenerator
-from typing import Annotated
+from typing import Annotated, Generic, TypeVar
 
 import pytest
 
 import strawberry
 from strawberry.extensions.field_extension import FieldExtension
+from strawberry.field_extensions import InputMutationExtension
 from strawberry.permission import BasePermission
 from strawberry.types import Info
 from strawberry.types.execution import PreExecutionError
 from strawberry.types.field import StrawberryField
 from strawberry.utils.aio import aclosing
+
+T = TypeVar("T")
 
 
 class CustomValidationError(Exception):
@@ -919,3 +923,238 @@ def test_federation_schema_passes_exception_handlers_to_resolvers():
 
     assert result.errors is None
     assert result.data == {"create": {"message": "value is too short"}}
+
+
+@pytest.mark.asyncio
+async def test_exception_handler_converts_conversion_error_with_async_extension():
+    # An async field extension `await`s the inner result, so the handled payload
+    # produced on the conversion-error path must be awaitable too.
+    class Allow(BasePermission):
+        message = "denied"
+
+        async def has_permission(self, source, info, **kwargs) -> bool:  # noqa: ANN003
+            return True
+
+    @strawberry.type
+    class Mutation:
+        @strawberry.mutation(permission_classes=[Allow])
+        async def create(self, input: CustomInput) -> Success | ValidationErrorPayload:
+            return Success(value=input.value)
+
+    schema = strawberry.Schema(
+        query=Query,
+        mutation=Mutation,
+        exception_handlers=[CustomValidationHandler()],
+    )
+
+    result = await schema.execute(
+        """
+        mutation {
+            create(input: { value: "a" }) {
+                ... on Success {
+                    value
+                }
+                ... on ValidationErrorPayload {
+                    message
+                }
+            }
+        }
+        """
+    )
+
+    assert result.errors is None
+    assert result.data == {"create": {"message": "value is too short"}}
+
+
+def test_exception_handler_converts_conversion_error_with_input_mutation_extension():
+    # `InputMutationExtension` calls `vars(input)` on the arguments; the raw
+    # values passed on the conversion-error path must not crash it before the
+    # handler runs.
+    @strawberry.type
+    class Mutation:
+        @strawberry.mutation(extensions=[InputMutationExtension()])
+        def create(self, data: CustomInput) -> Success | ValidationErrorPayload:
+            return Success(value=data.value)
+
+    schema = strawberry.Schema(
+        query=Query,
+        mutation=Mutation,
+        exception_handlers=[CustomValidationHandler()],
+    )
+
+    result = schema.execute_sync(
+        """
+        mutation {
+            create(input: { data: { value: "a" } }) {
+                ... on Success {
+                    value
+                }
+                ... on ValidationErrorPayload {
+                    message
+                }
+            }
+        }
+        """
+    )
+
+    assert result.errors is None
+    assert result.data == {"create": {"message": "value is too short"}}
+
+
+def test_exception_handler_matches_concrete_generic_error_type_in_union():
+    @strawberry.type
+    class GenericError(Generic[T]):
+        message: str
+        value: T
+
+    class GenericHandler(strawberry.ExceptionHandler):
+        exception_type = CustomValidationError
+        error_type = GenericError[int]
+
+        def handle(self, exception, *, field, info) -> "GenericError[int]":
+            return GenericError[int](message=str(exception), value=0)
+
+    @strawberry.type
+    class Mutation:
+        @strawberry.mutation
+        def create(self) -> Success | GenericError[int]:
+            raise CustomValidationError("boom")
+
+    schema = strawberry.Schema(
+        query=Query,
+        mutation=Mutation,
+        exception_handlers=[GenericHandler()],
+    )
+
+    result = schema.execute_sync(
+        """
+        mutation {
+            create {
+                ... on Success {
+                    value
+                }
+                ... on IntGenericError {
+                    message
+                    intValue: value
+                }
+            }
+        }
+        """
+    )
+
+    assert result.errors is None
+    assert result.data == {"create": {"message": "boom", "intValue": 0}}
+
+
+def test_exception_handler_converts_basic_field_error_to_union_type():
+    # A "basic" field (a plain attribute with no resolver) whose return type is
+    # a union should still have its errors converted; whether an unrelated
+    # extension is attached must not change this.
+    @strawberry.type
+    class Query:
+        ok: bool = True
+        result: Success | ValidationErrorPayload
+
+    class Root:
+        ok = True
+
+        @property
+        def result(self) -> None:
+            raise CustomValidationError("basic field boom")
+
+    schema = strawberry.Schema(
+        query=Query,
+        exception_handlers=[CustomValidationHandler()],
+    )
+
+    result = schema.execute_sync(
+        """
+        {
+            result {
+                ... on Success {
+                    value
+                }
+                ... on ValidationErrorPayload {
+                    message
+                }
+            }
+        }
+        """,
+        root_value=Root(),
+    )
+
+    assert result.errors is None
+    assert result.data == {"result": {"message": "basic field boom"}}
+
+
+def test_exception_handler_protocol_is_runtime_checkable():
+    assert isinstance(CustomValidationHandler(), strawberry.ExceptionHandler)
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        pytest.param(CustomValidationHandler, id="class-not-instance"),
+        pytest.param(
+            type(
+                "MissingExceptionType",
+                (strawberry.ExceptionHandler,),
+                {
+                    "error_type": ValidationErrorPayload,
+                    "handle": lambda self, exception, *, field, info: None,
+                },
+            )(),
+            id="missing-exception-type",
+        ),
+        pytest.param(
+            type(
+                "StringExceptionType",
+                (strawberry.ExceptionHandler,),
+                {
+                    "exception_type": "CustomValidationError",
+                    "error_type": ValidationErrorPayload,
+                    "handle": lambda self, exception, *, field, info: None,
+                },
+            )(),
+            id="string-exception-type",
+        ),
+        pytest.param(
+            type(
+                "MissingErrorType",
+                (strawberry.ExceptionHandler,),
+                {
+                    "exception_type": CustomValidationError,
+                    "handle": lambda self, exception, *, field, info: None,
+                },
+            )(),
+            id="missing-error-type",
+        ),
+        pytest.param(
+            type(
+                "MistypedHandle",
+                (strawberry.ExceptionHandler,),
+                {
+                    "exception_type": CustomValidationError,
+                    "error_type": ValidationErrorPayload,
+                    "handel": lambda self, exception, *, field, info: None,
+                },
+            )(),
+            id="mistyped-handle",
+        ),
+    ],
+)
+def test_schema_rejects_malformed_exception_handlers(handler):
+    with pytest.raises(TypeError):
+        strawberry.Schema(query=Query, exception_handlers=[handler])
+
+
+def test_federation_schema_exception_handlers_come_after_federation_version():
+    # `exception_handlers` must not sit before `federation_version` in the
+    # signature, or a positional `federation_version` would land in it.
+    parameters = list(
+        inspect.signature(strawberry.federation.Schema.__init__).parameters
+    )
+
+    assert parameters.index("exception_handlers") > parameters.index(
+        "federation_version"
+    )
